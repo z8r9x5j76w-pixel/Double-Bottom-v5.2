@@ -187,7 +187,7 @@ else:
         color = "#10b981" if val > 0 else "#ef4444" if val < 0 else "#94a3b8"
         return f"color: {color}; font-weight: 600"
 
-    styled = positions_df.style.applymap(
+    styled = positions_df.style.map(
         colour_pnl, subset=["unreal_pct","unreal_pnl"])
     st.dataframe(
         styled,
