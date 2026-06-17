@@ -257,6 +257,10 @@ if positions_df.empty:
 else:
     # Add progress column
     pos_display = positions_df.copy()
+    # Convert all date-like columns to plain strings to avoid timestamp rendering
+    for col in ["entry_date", "mh_exit_est"]:
+        if col in pos_display.columns:
+            pos_display[col] = pos_display[col].astype(str)
     pos_display["progress"] = pos_display["days_held"] / MAX_HOLD
 
     def colour_pnl(val):
