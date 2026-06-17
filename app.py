@@ -207,7 +207,7 @@ else:
         unsafe_allow_html=True
     )
     st.dataframe(
-        live_df[["ticker","signal_date","neckline","ref_close","est_sl","est_tp","strength_pct"]],
+        live_df[["ticker","signal_date","neckline","ref_close","est_sl","est_tp","strength_pct"]].assign(signal_date=lambda x: x["signal_date"].astype(str)),
         use_container_width=True,
         hide_index=True,
         column_config={
