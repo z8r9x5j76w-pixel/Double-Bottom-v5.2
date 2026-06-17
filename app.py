@@ -1,27 +1,31 @@
 """
 Double Bottom Scanner v5.2 — Streamlit App
 ==========================================
-Run locally:   streamlit run app.py
-Deploy:        push to GitHub + connect to Streamlit Cloud
+Two completely separate sections:
 
-Expects tickers.txt in the same directory.
+SECTION 1 — LIVE SIGNALS (today's actionable trades)
+  Scans the latest close for fresh breakouts.
+  These are NEW signals to consider for next open entry.
+  No position limit applied — shows ALL signals that fired.
+
+SECTION 2 — BACKTEST TRACKER (historical simulation)
+  Shows what the backtest engine currently holds.
+  For reference/validation only — NOT your live portfolio.
+  Helps you understand strategy health and current drawdown.
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import sys, time
+import sys
 from pathlib import Path
 
-# ── Import scanner core ───────────────────────────────────────────────────────
-# We import functions directly from the scanner module
 sys.path.insert(0, str(Path(__file__).parent))
 from double_bottom_scanner_v5_2 import (
     load_universe, download_data, run_backtest, compute_metrics,
-    SL, TP, MAX_HOLD, TREND_SMA, TOL, NOTIONAL, MAX_POSITIONS, TRADING_DAYS
+    find_neckline, SL, TP, MAX_HOLD, TREND_SMA, TOL, NOTIONAL, MAX_POSITIONS, TRADING_DAYS
 )
 
-# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Double Bottom Scanner v5.2",
     page_icon="📉",
@@ -29,23 +33,21 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Styles ────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    .metric-card {
-        background: #1e1e2e;
+    .live-signal-box {
+        background: #052e16;
+        border: 1.5px solid #16a34a;
         border-radius: 8px;
-        padding: 16px 20px;
-        border-left: 3px solid #7c3aed;
+        padding: 14px 18px;
+        margin-bottom: 10px;
     }
-    .metric-value { font-size: 1.6rem; font-weight: 700; color: #e2e8f0; }
-    .metric-label { font-size: 0.75rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; }
-    .signal-box {
-        background: #064e3b;
-        border: 1px solid #10b981;
+    .backtest-box {
+        background: #1e1b4b;
+        border: 1px solid #4f46e5;
         border-radius: 8px;
-        padding: 12px 16px;
-        margin-bottom: 8px;
+        padding: 14px 18px;
+        margin-bottom: 10px;
     }
     .warn-box {
         background: #431407;
@@ -53,81 +55,191 @@ st.markdown("""
         border-radius: 8px;
         padding: 10px 14px;
         font-size: 0.85rem;
+        margin-bottom: 12px;
     }
-    [data-testid="stMetricValue"] { font-size: 1.4rem !important; }
+    .section-label-live {
+        background: #16a34a;
+        color: white;
+        font-size: 0.7rem;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        padding: 2px 8px;
+        border-radius: 4px;
+        display: inline-block;
+        margin-bottom: 6px;
+    }
+    .section-label-bt {
+        background: #4f46e5;
+        color: white;
+        font-size: 0.7rem;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        padding: 2px 8px;
+        border-radius: 4px;
+        display: inline-block;
+        margin-bottom: 6px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## ⚙️ Double Bottom v5.2")
+    st.markdown("## 📉 Double Bottom v5.2")
     st.markdown(f"""
     **Config (locked)**
-    - TOL: `{TOL}` (tight symmetry)
-    - Trend: SMA{TREND_SMA}
+    - TOL: `{TOL}` | Trend: SMA{TREND_SMA}
     - Entry: open > neckline ✅
     - SL: `{SL*100:.0f}%` | TP: `{TP*100:.0f}%`
     - MaxHold: `{MAX_HOLD}` sessions
     - Notional: `${NOTIONAL:,.0f}` / trade
-    - Max positions: `{MAX_POSITIONS}`
     """)
     st.divider()
     st.markdown("""
-    **Backtest stats (5yr)**
-    - Sharpe: `1.858`
-    - CAGR: `11.17%`
-    - Calmar: `1.27`
-    - MaxDD: `$-1,760`
-    - Win rate: `29.3%` *(BE: 22.2%)*
+    **Backtest (5yr)**
+    Sharpe `1.858` | CAGR `11.17%`
+    Calmar `1.27` | MaxDD `$-1,760`
+    Win rate `29.3%` *(BE: 22.2%)*
     """)
     st.divider()
     run_btn = st.button("🔄  Run Scanner", type="primary", use_container_width=True)
-    st.caption("Downloads 5yr daily data + runs backtest. ~2–3 min.")
+    st.caption("Downloads 5yr daily data + runs backtest. ~2–3 min first run, cached 1hr after.")
 
 
-# ── Caching ───────────────────────────────────────────────────────────────────
+# ── Cache ─────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def run_full_scan():
-    universe = load_universe()
-    data     = download_data(universe)
-    date_sets= [set(df.index) for df in data.values()]
-    dates    = pd.DatetimeIndex(sorted(set.intersection(*date_sets)))
-    trades_df, positions_df, daily_pnl, asof, enter_df, exit_df = run_backtest(data, dates)
-    m        = compute_metrics(trades_df, daily_pnl, len(dates))
-    equity   = pd.DataFrame({
+    universe  = load_universe()
+    data      = download_data(universe)
+    date_sets = [set(df.index) for df in data.values()]
+    dates     = pd.DatetimeIndex(sorted(set.intersection(*date_sets)))
+
+    trades_df, positions_df, daily_pnl, asof, enter_df, exit_df = \
+        run_backtest(data, dates)
+    m = compute_metrics(trades_df, daily_pnl, len(dates))
+
+    # ── LIVE SIGNALS: fresh scan of latest close, NO position cap ────────────
+    sma_cache = {t: df["Close"].rolling(TREND_SMA).mean() for t, df in data.items()}
+    live_signals = []
+    if len(dates) >= 2:
+        lat = dates[-1]
+        for ticker, df in data.items():
+            if lat not in df.index: continue
+            di = df.index.get_loc(lat)
+            if di < 1: continue
+            neck = find_neckline(df, di)
+            if neck is None: continue
+            ct = float(df["Close"].iloc[di])
+            cy = float(df["Close"].iloc[di - 1])
+            if not (cy <= neck < ct): continue
+            sma = sma_cache[ticker].iloc[di]
+            if pd.isna(sma) or ct <= float(sma): continue
+            strength = (ct - neck) / neck
+            live_signals.append(dict(
+                ticker       = ticker,
+                signal_date  = lat.date(),
+                neckline     = round(neck, 2),
+                ref_close    = round(ct, 2),
+                est_sl       = round(ct * (1 - SL), 2),
+                est_tp       = round(ct * (1 + TP), 2),
+                strength_pct = round(strength * 100, 2),
+                note         = "⚠ Recalculate SL/TP from actual fill at open",
+            ))
+    live_df = pd.DataFrame(live_signals).sort_values(
+        "strength_pct", ascending=False) if live_signals else pd.DataFrame()
+
+    equity = pd.DataFrame({
         "Date": dates,
-        "Cumulative P&L ($)": np.cumsum(daily_pnl)
+        "Cumulative P&L ($)": np.cumsum(daily_pnl),
     }).set_index("Date")
-    return trades_df, positions_df, daily_pnl, asof, enter_df, exit_df, m, equity, len(dates)
+
+    return data, dates, trades_df, positions_df, daily_pnl, asof, \
+           enter_df, exit_df, m, equity, live_df
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Gate ──────────────────────────────────────────────────────────────────────
 st.title("📉 Double Bottom Scanner v5.2")
-st.caption("Production | Config C + Open Confirmation | TOL=0.02 | SMA50 | SL=2% TP=7% MH=30")
 
 if not run_btn and "scan_done" not in st.session_state:
-    st.info("Click **Run Scanner** in the sidebar to fetch data and run the backtest.")
+    st.info("Click **Run Scanner** in the sidebar to load data.")
     st.stop()
 
-# Run or use cache
 if run_btn or "scan_done" not in st.session_state:
-    with st.spinner("Downloading data and running backtest…"):
+    with st.spinner("Downloading data and running backtest… (~2 min)"):
         try:
             result = run_full_scan()
             st.session_state["scan_done"]   = True
             st.session_state["scan_result"] = result
         except Exception as e:
-            st.error(f"Scanner error: {e}")
+            st.error(f"Error: {e}")
             st.stop()
 
-trades_df, positions_df, daily_pnl, asof, enter_df, exit_df, m, equity, n_dates = \
-    st.session_state["scan_result"]
+(data, dates, trades_df, positions_df, daily_pnl,
+ asof, enter_df, exit_df, m, equity, live_df) = st.session_state["scan_result"]
 
-st.caption(f"Last run: as-of close **{asof}**")
+st.caption(f"Data as-of close: **{asof}**  |  Today's signals based on this close.")
 
-# ── KPI row ───────────────────────────────────────────────────────────────────
-st.divider()
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 1 — LIVE SIGNALS
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("---")
+st.markdown('<span class="section-label-live">🟢 LIVE SIGNALS</span>', unsafe_allow_html=True)
+st.subheader("Today's Actionable Signals — Enter at Next Open")
+st.markdown(
+    "These are **fresh breakouts detected on today's close**. "
+    "Each ticker has crossed its double-bottom neckline with SMA50 confirmation. "
+    "**No position limit applied** — all valid signals shown. You decide how many to take."
+)
+
+if live_df.empty:
+    if asof == pd.Timestamp.now().date():
+        st.info("No double-bottom breakouts detected on today's close.")
+    else:
+        st.warning(
+            f"Signal date is **{asof}** — market may not have closed yet today. "
+            "Re-run after 4pm ET to get today's signals."
+        )
+else:
+    st.markdown(
+        '<div class="warn-box">⚠️ <strong>Est. SL/TP use today\'s close as proxy. '
+        'Always recalculate from your actual fill price at open before placing bracket orders.'
+        '</strong></div>',
+        unsafe_allow_html=True
+    )
+    st.dataframe(
+        live_df[["ticker","signal_date","neckline","ref_close","est_sl","est_tp","strength_pct"]],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "ticker":       st.column_config.TextColumn("Ticker"),
+            "signal_date":  st.column_config.TextColumn("Signal Date"),
+            "neckline":     st.column_config.NumberColumn("Neckline",    format="$%.2f"),
+            "ref_close":    st.column_config.NumberColumn("Ref Close",   format="$%.2f"),
+            "est_sl":       st.column_config.NumberColumn("Est SL (2%)", format="$%.2f"),
+            "est_tp":       st.column_config.NumberColumn("Est TP (7%)", format="$%.2f"),
+            "strength_pct": st.column_config.NumberColumn("Strength",    format="%.2f%%"),
+        }
+    )
+    st.caption(
+        f"**How to use:** At market open tomorrow, check if open price > neckline. "
+        f"If yes → enter. If open gaps back below neckline → skip (open-confirmation rule). "
+        f"Set SL = fill × 0.98, TP = fill × 1.07, exit by session {MAX_HOLD} if neither hit."
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 2 — BACKTEST TRACKER
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("---")
+st.markdown('<span class="section-label-bt">🔵 BACKTEST TRACKER</span>', unsafe_allow_html=True)
+st.subheader("Backtest Simulation — Historical Reference Only")
+st.markdown(
+    "**This is not your live portfolio.** "
+    "These are positions held by the backtest simulation as of the latest date. "
+    "They show how the strategy *would* be positioned if run mechanically since inception. "
+    "Use this to validate strategy health and track paper performance."
+)
+
+# KPI row
 k1, k2, k3, k4, k5, k6 = st.columns(6)
 k1.metric("Total P&L",    f"${m['total']:,.0f}")
 k2.metric("CAGR",         f"{m['cagr']}%")
@@ -136,62 +248,32 @@ k4.metric("Calmar",       f"{m['calmar']}")
 k5.metric("Max Drawdown", f"${m['max_dd']:,.0f}")
 k6.metric("Win Rate",     f"{m['wr']}%")
 
-# ── Action sheet ──────────────────────────────────────────────────────────────
-st.divider()
-st.subheader(f"📋 Action Sheet — {asof}")
+# Backtest open positions
+st.markdown("#### Backtest Open Positions")
+st.caption("Positions currently open in the simulation. Progress bar = sessions used / 30 max.")
 
-col_exits, col_entries = st.columns([1, 2])
-
-with col_exits:
-    st.markdown("**Exit next open**")
-    if exit_df.empty:
-        st.success("No exits scheduled")
-    else:
-        for _, r in exit_df.iterrows():
-            st.warning(f"SELL **{r.ticker}** — {r.reason} (held {r.days_held} sessions)")
-
-with col_entries:
-    slots = MAX_POSITIONS - (0 if positions_df.empty else len(positions_df))
-    st.markdown(f"**Enter next open** — {slots} slot{'s' if slots != 1 else ''} available")
-    if enter_df.empty or slots <= 0:
-        if slots <= 0:
-            st.info("Max positions reached — no new entries")
-        else:
-            st.info("No signals today")
-    else:
-        show = enter_df.head(slots).copy()
-        st.markdown(
-            '<div class="warn-box">⚠️ Est. SL/TP based on ref_close. '
-            'Recalculate from actual fill price before placing orders.</div>',
-            unsafe_allow_html=True)
-        st.dataframe(
-            show[["ticker","neckline","ref_close","est_sl","est_tp","strength_pct"]],
-            use_container_width=True, hide_index=True,
-            column_config={
-                "ticker":       st.column_config.TextColumn("Ticker"),
-                "neckline":     st.column_config.NumberColumn("Neckline",   format="$%.2f"),
-                "ref_close":    st.column_config.NumberColumn("Ref Close",  format="$%.2f"),
-                "est_sl":       st.column_config.NumberColumn("Est SL",     format="$%.2f"),
-                "est_tp":       st.column_config.NumberColumn("Est TP",     format="$%.2f"),
-                "strength_pct": st.column_config.NumberColumn("Strength %", format="%.2f%%"),
-            }
-        )
-
-# ── Open positions ────────────────────────────────────────────────────────────
-st.divider()
-st.subheader("📂 Open Positions")
 if positions_df.empty:
-    st.info("No open positions")
+    st.info("No open positions in backtest simulation.")
 else:
-    def colour_pnl(val):
-        color = "#10b981" if val > 0 else "#ef4444" if val < 0 else "#94a3b8"
-        return f"color: {color}; font-weight: 600"
+    # Add progress column
+    pos_display = positions_df.copy()
+    pos_display["progress"] = pos_display["days_held"] / MAX_HOLD
 
-    styled = positions_df.style.map(
-        colour_pnl, subset=["unreal_pct","unreal_pnl"])
+    def colour_pnl(val):
+        if isinstance(val, (int, float)):
+            color = "#16a34a" if val > 0 else "#dc2626" if val < 0 else "#94a3b8"
+            return f"color: {color}; font-weight: 600"
+        return ""
+
     st.dataframe(
-        styled,
-        use_container_width=True, hide_index=True,
+        pos_display[[
+            "ticker","entry_date","entry_price","neckline",
+            "sl_price","tp_price","last_close",
+            "days_held","days_remaining","mh_exit_est",
+            "unreal_pct","unreal_pnl","progress"
+        ]],
+        use_container_width=True,
+        hide_index=True,
         column_config={
             "ticker":         st.column_config.TextColumn("Ticker"),
             "entry_date":     st.column_config.TextColumn("Entry Date"),
@@ -200,65 +282,57 @@ else:
             "sl_price":       st.column_config.NumberColumn("SL",        format="$%.2f"),
             "tp_price":       st.column_config.NumberColumn("TP",        format="$%.2f"),
             "last_close":     st.column_config.NumberColumn("Last",      format="$%.2f"),
-            "days_held":      st.column_config.NumberColumn("Held",      format="%d"),
-            "days_remaining": st.column_config.NumberColumn("Remaining", format="%d"),
+            "days_held":      st.column_config.NumberColumn("Held",      format="%d sessions"),
+            "days_remaining": st.column_config.NumberColumn("Remaining", format="%d sessions"),
             "mh_exit_est":    st.column_config.TextColumn("MH Exit"),
             "unreal_pct":     st.column_config.NumberColumn("Unreal %",  format="%.1f%%"),
             "unreal_pnl":     st.column_config.NumberColumn("Unreal $",  format="$%.2f"),
+            "progress":       st.column_config.ProgressColumn(
+                                "Hold Progress", min_value=0, max_value=1, format="%.0%%"),
         }
     )
 
-# ── Equity curve ──────────────────────────────────────────────────────────────
-st.divider()
-st.subheader("📈 Equity Curve (Cumulative P&L)")
-st.line_chart(equity, use_container_width=True, color="#7c3aed")
+# Equity curve
+st.markdown("#### Backtest Equity Curve")
+st.line_chart(equity, use_container_width=True, color="#4f46e5")
 
-# ── Trade log ─────────────────────────────────────────────────────────────────
-st.divider()
-st.subheader("📒 Trade Log")
-
+# Trade log
+st.markdown("#### Backtest Trade Log")
 tab_recent, tab_winners, tab_losers, tab_full = st.tabs(
     ["Latest 20", "Top Winners", "Worst Losers", "Full Log"])
 
 with tab_recent:
     st.dataframe(trades_df.head(20), use_container_width=True, hide_index=True)
-
 with tab_winners:
-    top_w = trades_df[trades_df["pnl"] > 0].sort_values("pnl", ascending=False).head(20)
-    st.dataframe(top_w, use_container_width=True, hide_index=True)
-
+    st.dataframe(
+        trades_df[trades_df["pnl"] > 0].sort_values("pnl", ascending=False).head(20),
+        use_container_width=True, hide_index=True)
 with tab_losers:
-    top_l = trades_df[trades_df["pnl"] < 0].sort_values("pnl").head(20)
-    st.dataframe(top_l, use_container_width=True, hide_index=True)
-
+    st.dataframe(
+        trades_df[trades_df["pnl"] < 0].sort_values("pnl").head(20),
+        use_container_width=True, hide_index=True)
 with tab_full:
     st.dataframe(trades_df, use_container_width=True, hide_index=True)
-    csv = trades_df.to_csv(index=False).encode()
-    st.download_button("⬇️ Download CSV", csv, "double_bottom_trades.csv", "text/csv")
+    st.download_button(
+        "⬇️ Download CSV", trades_df.to_csv(index=False).encode(),
+        "double_bottom_trades.csv", "text/csv")
 
-# ── Exit breakdown ────────────────────────────────────────────────────────────
-st.divider()
-st.subheader("📊 Exit Breakdown")
-c1, c2 = st.columns(2)
+# Monthly P&L
+st.markdown("#### Monthly P&L (Backtest)")
+monthly = (trades_df
+    .assign(month=pd.to_datetime(trades_df["exit_date"]).dt.to_period("M"))
+    .groupby("month")["pnl"].sum()
+    .reset_index()
+    .assign(month=lambda x: x["month"].astype(str),
+            colour=lambda x: x["pnl"].apply(lambda v: "🟢" if v >= 0 else "🔴")))
+monthly.columns = ["Month","P&L ($)",""]
+st.dataframe(
+    monthly.sort_values("Month", ascending=False).head(24),
+    use_container_width=True, hide_index=True)
 
-with c1:
-    reason_counts = trades_df["reason"].value_counts().reset_index()
-    reason_counts.columns = ["Reason", "Count"]
-    st.dataframe(reason_counts, use_container_width=True, hide_index=True)
-    st.caption(f"SL {m['pct_sl']}%  |  TP {m['pct_tp']}%  |  MaxHold {m['pct_mh']}%")
-
-with c2:
-    monthly = (trades_df
-               .assign(month=pd.to_datetime(trades_df["exit_date"]).dt.to_period("M"))
-               .groupby("month")["pnl"].sum()
-               .reset_index()
-               .assign(month=lambda x: x["month"].astype(str)))
-    monthly.columns = ["Month", "P&L ($)"]
-    st.dataframe(monthly.sort_values("Month", ascending=False).head(24),
-                 use_container_width=True, hide_index=True)
-
-st.divider()
+st.markdown("---")
 st.caption(
-    "Double Bottom Scanner v5.2 | Research only — not financial advice. "
-    f"Config: TOL={TOL} | SMA{TREND_SMA} | SL={SL*100:.0f}% | TP={TP*100:.0f}% | MaxHold={MAX_HOLD}"
+    "📉 Double Bottom Scanner v5.2 | Research only — not financial advice. "
+    f"Config: TOL={TOL} | SMA{TREND_SMA} | open-confirm | "
+    f"SL={SL*100:.0f}% | TP={TP*100:.0f}% | MaxHold={MAX_HOLD}"
 )
